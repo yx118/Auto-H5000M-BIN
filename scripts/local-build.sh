@@ -341,22 +341,114 @@ fix_qmi_driver() {
 patch_v2dat_go124() {
   local patch_dir="package/mosdns/v2dat/patches"
   [ -d "$patch_dir" ] || return 0
+
+  strip_patch_file_diffs() {
+    local patch_file="$1"
+    local file_pattern="$2"
+    local tmp_patch
+    tmp_patch="$(mktemp)"
+    awk -v file_pattern="$file_pattern" '
+      function flush_section() {
+        if (in_section && keep_section) {
+          printf "%s", section_block
+        }
+        in_section=0
+        section_block=""
+        keep_section=0
+      }
+      /^diff --git / {
+        flush_section()
+        in_section=1
+        section_block=$0 ORS
+        keep_section=($0 !~ file_pattern)
+        next
+      }
+      /^--- a\// {
+        flush_section()
+        in_section=1
+        section_block=$0 ORS
+        keep_section=($0 !~ file_pattern)
+        next
+      }
+      in_section {
+        section_block=section_block $0 ORS
+        next
+      }
+      { print }
+      END {
+        flush_section()
+      }
+    ' "$patch_file" > "$tmp_patch"
+    mv "$tmp_patch" "$patch_file"
+  }
+
+  local perf_patch="$patch_dir/102-perf-unpack-Use-memory-mapping-to-reduce-memory-usag.patch"
+  if [ -f "$perf_patch" ]; then
+    log "Removing fragile v2dat go.mod/go.sum hunks from $(basename "$perf_patch")"
+    strip_patch_file_diffs "$perf_patch" '(^--- a/go[.](mod|sum)$| a/go[.](mod|sum) b/go[.](mod|sum)$)'
+  fi
+
   local patch_files
   patch_files="$(grep -RIl 'go 1\.25\.0\|go 1\.24\|golang.org/x/sys v0\.42\.0' "$patch_dir" || true)"
   if [ -n "$patch_files" ]; then
     printf '%s\n' "$patch_files" | xargs sed -i \
       -e 's/go 1\.25\.0/go 1.24.0/g' \
-      -e 's/^@@ -1,8 +1,9 @@$/@@ -1,8 +1,11 @@/g' \
-      -e 's/^@@ -12,4 +13,5 @@ require ($/@@ -12,4 +15,5 @@ require (/g' \
       -e 's|golang.org/x/sys v0\.42\.0 // indirect|golang.org/x/sys v0.37.0 // indirect|g' \
       -e 's|golang.org/x/sys v0\.42\.0 h1:omrd2nAlyT5ESRdCLYdm3+fMfNFE/+Rf4bDIQImRJeo=|golang.org/x/sys v0.37.0 h1:fdNQudmxPjkdUTPnLn5mdQv7Zwvbvpaxqs831goi9kQ=|g' \
       -e 's|golang.org/x/sys v0\.42\.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=|golang.org/x/sys v0.37.0/go.mod h1:OgkHotnGiDImocRcuBABYBEXf8A9a87e/uXjp9XT3ks=|g'
-    printf '%s\n' "$patch_files" | while IFS= read -r patch_file; do
-      perl -0pi -e 's/^\+go 1\.24(?:\.0)?\n(?:\+\n\+toolchain go1\.24\.13\n)+/+go 1.24.0\n+\n+toolchain go1.24.13\n/m' "$patch_file"
-      perl -0pi -e 's/(h1:[^\n ]+=) (github\.com\/google\/go-cmp)/$1\n+$2/g' "$patch_file"
-      perl -0pi -e 's/(h1:[^\n ]+=) (google\.golang\.org\/protobuf)/$1\n+$2/g' "$patch_file"
-    done
   fi
+
+  local v2dat_makefile="package/mosdns/v2dat/Makefile"
+  if [ -f "$v2dat_makefile" ]; then
+    sed -i '/^GO_MOD_ARGS[[:space:]]*[:+?]*=/d' "$v2dat_makefile"
+    sed -i '/golang-package.mk/a GO_MOD_ARGS:= -mod=mod -modcacherw' "$v2dat_makefile"
+
+    local tmp_makefile
+    tmp_makefile="$(mktemp)"
+    awk '
+      /^define Build\/Prepare$/ {
+        collecting=1
+        block=$0 ORS
+        next
+      }
+      collecting {
+        block=block $0 ORS
+        if ($0 == "endef") {
+          if (block !~ /v2dat Go 1\.24 dependency compatibility/) {
+            printf "%s", block
+          }
+          collecting=0
+          block=""
+        }
+        next
+      }
+      { print }
+      END {
+        if (collecting && block !~ /v2dat Go 1\.24 dependency compatibility/) {
+          printf "%s", block
+        }
+      }
+    ' "$v2dat_makefile" > "$tmp_makefile"
+    mv "$tmp_makefile" "$v2dat_makefile"
+
+    tmp_makefile="$(mktemp)"
+    awk '
+      /^\$\(eval \$\(call GoBinPackage,v2dat\)\)/ && !inserted {
+        print "define Build/Prepare"
+        print "\t$(call Build/Prepare/Default)"
+        print "\t# v2dat Go 1.24 dependency compatibility"
+        print "\tsed -i -E \047s|^go 1\\.[0-9]+(\\.[0-9]+)?|go 1.24.0|g\047 $(PKG_BUILD_DIR)/go.mod"
+        print "\tsed -i -E \047s|^toolchain go1\\.[0-9]+(\\.[0-9]+)?|toolchain go1.24.13|g\047 $(PKG_BUILD_DIR)/go.mod"
+        print "\tsed -i \047s|golang.org/x/sys v0.42.0|golang.org/x/sys v0.37.0|g\047 $(PKG_BUILD_DIR)/go.mod"
+        print "endef"
+        print ""
+        inserted=1
+      }
+      { print }
+    ' "$v2dat_makefile" > "$tmp_makefile"
+    mv "$tmp_makefile" "$v2dat_makefile"
+  fi
+
   rm -f "$patch_dir/999-fix-go-version-for-go124.patch"
   rm -rf build_dir/target-*/v2dat-* 2>/dev/null || true
 }
